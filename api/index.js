@@ -1,15 +1,17 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "claude-haiku-5-5";
+const ANTHROPIC_VERSION = "2023-06-01";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
+const MAX_OUTPUT_TOKENS = 300;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const CLAUDE_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
-  "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
-  "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
+  "Ты — полезный голосовой помощник в навыке Яндекс Алисы. Твой текст будет озвучен голосом.",
+  "Отвечай кратко, разговорно и только на русском языке.",
+  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки, эмодзи, ссылки и длинные вступления.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
@@ -110,77 +112,83 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
+async function askClaude(text, history, searchContext, timeoutMs) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) throw new Error("MISSING_ANTHROPIC_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  const model = String(process.env.CLAUDE_MODEL || DEFAULT_MODEL).trim();
   if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
+  // History is stored with the "model" role; Claude expects "assistant".
+  const messages = safeHistory(history).map(item => ({
+    role: item.role === "model" ? "assistant" : "user",
+    content: item.text
   }));
+  // Claude requires the conversation to start with a user message.
+  while (messages.length && messages[0].role !== "user") messages.shift();
 
   const prompt = searchContext
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
     : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  messages.push({ role: "user", content: prompt });
 
   const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    "https://api.anthropic.com/v1/messages",
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": key
+        "x-api-key": key,
+        "anthropic-version": ANTHROPIC_VERSION
       },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
+        model,
+        max_tokens: MAX_OUTPUT_TOKENS,
+        system: SYSTEM_PROMPT,
+        messages,
+        // Thinking is off and effort is low so the answer fits Alice's time limit.
+        thinking: { type: "disabled" },
+        output_config: { effort: "low" }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(CLAUDE_TIMEOUT_MS, timeoutMs)
   );
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
+    console.error("Claude request failed with HTTP", status, data?.error?.message || "");
+    if (status === 401 || status === 403) throw new Error("CLAUDE_KEY_REJECTED");
+    if (status === 404) throw new Error("CLAUDE_MODEL_NOT_FOUND");
+    if (status === 429) throw new Error("CLAUDE_QUOTA");
+    throw new Error("CLAUDE_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
+  if (data?.stop_reason === "refusal") throw new Error("CLAUDE_BLOCKED");
+
+  const answer = (Array.isArray(data?.content) ? data.content : [])
+    .map(block => block?.type === "text" && typeof block.text === "string" ? block.text : "")
     .join("")
     .trim();
 
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
+  if (!answer) throw new Error("CLAUDE_EMPTY_RESPONSE");
+  if (data?.stop_reason === "max_tokens") {
+    console.warn("Claude reached the output token limit.");
   }
   return answer;
 }
 
 function errorForUser(error) {
   switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
-    case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
-    case "GEMINI_BLOCKED":
+    case "MISSING_ANTHROPIC_KEY":
+      return "Сервер пока не настроен. Проверьте переменную ANTHROPIC_API_KEY в настройках Vercel.";
+    case "CLAUDE_KEY_REJECTED":
+      return "Не удалось подключиться к Claude. Проверьте API-ключ в настройках Vercel.";
+    case "CLAUDE_MODEL_NOT_FOUND":
+      return "Модель Claude не найдена. Проверьте переменную CLAUDE_MODEL в настройках Vercel.";
+    case "CLAUDE_QUOTA":
+      return "Сейчас превышен лимит запросов к Claude. Попробуйте немного позже.";
+    case "CLAUDE_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
@@ -194,7 +202,7 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-gemini-serper",
+      service: "alice-claude-serper",
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -225,11 +233,11 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askGemini(
+    const answer = await askClaude(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(CLAUDE_TIMEOUT_MS, remainingMs() - 600))
     );
 
     const history = [
@@ -240,7 +248,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
