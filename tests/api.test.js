@@ -43,7 +43,7 @@ test("GET health check returns an ok response", async () => {
   await handler({ method: "GET" }, res);
   assert.equal(statusCode, 200);
   assert.equal(payload.ok, true);
-  assert.equal(payload.service, "alice-gemini-serper");
+  assert.equal(payload.service, "alice-claude-serper");
 });
 
 test("launch request returns a valid Alice greeting without external API keys", async () => {
